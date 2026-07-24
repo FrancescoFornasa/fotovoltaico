@@ -18,11 +18,11 @@ shows up as total_act_ret_energy and as *negative* active power. Average power
 for a minute is therefore  total_act_ret_energy (Wh) * 60  ->  Watts.
 
 Examples:
-    python pv_day.py 2026-07-22
-    python pv_day.py 2026-07-22 --ip 192.168.0.103 --channel 1 -o day.png
-    python pv_day.py 2026-07-22 --quantity consumption --channel 0
-    python pv_day.py 2026-07-22 --weather   # overlay actual (cloud-affected) sun
-    python pv_day.py 2026-07-22 --expected  # datasheet model: PR % and kWh lost
+    python pv_day.py 22-07-2026
+    python pv_day.py 22-07-2026 --ip 192.168.0.103 --channel 1 -o day.png
+    python pv_day.py 22-07-2026 --quantity consumption --channel 0
+    python pv_day.py 22-07-2026 --weather   # overlay actual (cloud-affected) sun
+    python pv_day.py 22-07-2026 --expected  # datasheet model: PR % and kWh lost
 """
 
 from __future__ import annotations
@@ -166,31 +166,37 @@ def compass_to_solar_azimuth(compass_deg: float) -> float:
 
 def fetch_irradiance(lat: float, lon: float, day: dt.date, tz_name: str | None,
                      tilt: float, azimuth: float):
-    """Plane-of-array (tilted) irradiance for `day`, hourly, from Open-Meteo --
-    no API key. `tilt` is 0-90 deg; `azimuth` uses Open-Meteo's convention
-    (0 = south, -90 = east, +90 = west). Actual (cloud-affected) values, so the
-    curve dips on cloudy spells. Falls back to horizontal GHI if a source lacks
-    the tilted product. Tries the forecast endpoint (recent days, incl. today)
-    then the reanalysis archive (older days). Returns (hours, wm2, kind, temps)
-    or None; temps is ambient air degC (NaN where the source lacks it)."""
-    query = urllib.parse.urlencode({
+    """Plane-of-array (tilted) irradiance for `day` from Open-Meteo -- no API
+    key. `tilt` is 0-90 deg; `azimuth` uses Open-Meteo's convention (0 = south,
+    -90 = east, +90 = west). Uses the *instantaneous* products (`_instant`,
+    sampled at each timestamp, not period-averaged) so they align in time with
+    the 1-minute production data; still cloud-affected, so the curve dips on
+    cloudy spells. Resolution ladder, finest first: 15-minute from the forecast
+    endpoint (recent days, incl. today) -> hourly forecast -> hourly reanalysis
+    archive (older days). Falls back to horizontal GHI if a source lacks the
+    tilted product. Returns (hours, wm2, kind, temps) or None; temps is ambient
+    air degC (NaN where the source lacks it)."""
+    base_params = {
         "latitude": f"{lat:.6f}", "longitude": f"{lon:.6f}",
         "start_date": day.isoformat(), "end_date": day.isoformat(),
-        "hourly": "global_tilted_irradiance,shortwave_radiation,temperature_2m",
         "tilt": f"{tilt:g}", "azimuth": f"{azimuth:g}",
         "timezone": tz_name if (tz_name and "/" in tz_name) else "auto",
-    })
+    }
+    variables = ("global_tilted_irradiance_instant,"
+                 "shortwave_radiation_instant,temperature_2m")
     stamp = day.isoformat()
-    for base in ("https://api.open-meteo.com/v1/forecast",
-                 "https://archive-api.open-meteo.com/v1/archive"):
+    for base, block in (("https://api.open-meteo.com/v1/forecast", "minutely_15"),
+                        ("https://api.open-meteo.com/v1/forecast", "hourly"),
+                        ("https://archive-api.open-meteo.com/v1/archive", "hourly")):
+        query = urllib.parse.urlencode({**base_params, block: variables})
         try:
-            hourly = _get_json(f"{base}?{query}").get("hourly") or {}
+            section = _get_json(f"{base}?{query}").get(block) or {}
         except (urllib.error.URLError, ValueError, TimeoutError):
             continue
-        times = hourly.get("time") or []
-        gti = hourly.get("global_tilted_irradiance") or []
-        ghi = hourly.get("shortwave_radiation") or []
-        temp_by_t = dict(zip(times, hourly.get("temperature_2m") or []))
+        times = section.get("time") or []
+        gti = section.get("global_tilted_irradiance_instant") or []
+        ghi = section.get("shortwave_radiation_instant") or []
+        temp_by_t = dict(zip(times, section.get("temperature_2m") or []))
         if any(v is not None and v > 0 for v in gti):
             values, kind = gti, "Sun on panels"          # plane-of-array
         elif any(v is not None and v > 0 for v in ghi):
@@ -338,8 +344,17 @@ def hm(hour_float: float) -> str:
     return f"{total_min // 60:02d}:{total_min % 60:02d}"
 
 
+def parse_hour(text: str) -> float:
+    """Parse 'HH', 'HH:MM', or a decimal hour into hours-since-midnight."""
+    text = str(text).strip()
+    if ":" in text:
+        h, m = text.split(":", 1)
+        return int(h) + int(m) / 60.0
+    return float(text)
+
+
 def plot(series, summary, *, date_str, channel, tz_label, quantity,
-         span_hours, theme, show_band, out_path, do_show, weather=None,
+         x_start, x_end, theme, show_band, out_path, do_show, weather=None,
          expected=None):
     import matplotlib
     if not do_show:
@@ -358,7 +373,7 @@ def plot(series, summary, *, date_str, channel, tz_label, quantity,
 
     if show_band and series["band_lo"]:
         ax.fill_between(series["hours"], series["band_lo"], series["band_hi"],
-                        color=c["fill"], alpha=0.22, linewidth=0,
+                        color=c["muted"], alpha=0.38, linewidth=0,
                         label="min-max within each minute")
     if weather:
         ax.plot(weather["hours"], weather["ref_w"], color=c["ink2"],
@@ -392,7 +407,7 @@ def plot(series, summary, *, date_str, channel, tz_label, quantity,
                     color=c["ink"], fontsize=10, fontweight="bold")
 
     # Axes chrome
-    ax.set_xlim(0, span_hours)
+    ax.set_xlim(x_start, x_end)
     ax.xaxis.set_major_locator(MultipleLocator(2))
     ax.xaxis.set_minor_locator(MultipleLocator(1))
     ax.xaxis.set_major_formatter(FuncFormatter(lambda x, _pos: hm(x)))
@@ -461,7 +476,7 @@ def plot(series, summary, *, date_str, channel, tz_label, quantity,
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description="Plot Shelly Pro EM power for a given day at 1-minute resolution.")
-    p.add_argument("date", help="Local calendar date to plot, YYYY-MM-DD")
+    p.add_argument("date", help="Local calendar date to plot, dd-mm-yyyy")
     p.add_argument("--ip", default=DEFAULT_IP,
                    help=f"Shelly device IP (default: {DEFAULT_IP})")
     p.add_argument("-c", "--channel", type=int, default=DEFAULT_CHANNEL,
@@ -504,6 +519,12 @@ def parse_args(argv=None):
                    help="Save the chart to this PNG path")
     p.add_argument("--theme", default="light", choices=["light", "dark"],
                    help="Colour theme (default: light)")
+    p.add_argument("--start", default="05:00",
+                   help="Start of the plotted time-of-day window, HH:MM or hour "
+                        "(default: 05:00)")
+    p.add_argument("--end", default="22:00",
+                   help="End of the plotted time-of-day window, HH:MM or hour "
+                        "(default: 22:00)")
     p.add_argument("--no-band", action="store_true",
                    help="Hide the intra-minute min/max band")
     p.add_argument("--no-show", action="store_true",
@@ -515,9 +536,10 @@ def main(argv=None):
     args = parse_args(argv)
 
     try:
-        day = dt.date.fromisoformat(args.date)
+        day = dt.datetime.strptime(args.date, "%d-%m-%Y").date()
     except ValueError:
-        sys.exit(f"Invalid date '{args.date}'. Use YYYY-MM-DD, e.g. 2026-07-22.")
+        sys.exit(f"Invalid date '{args.date}'. Use dd-mm-yyyy, e.g. 22-07-2026.")
+    date_disp = day.strftime("%d-%m-%Y")
 
     tzinfo, tz_label = resolve_timezone(args.ip, args.tz)
     midnight = dt.datetime.combine(day, dt.time.min, tzinfo=tzinfo)
@@ -527,7 +549,15 @@ def main(argv=None):
     end_ts = int(next_midnight.timestamp())
     span_hours = (next_midnight - midnight).total_seconds() / 3600.0
 
-    print(f"Fetching {args.quantity} for {day} ({tz_label}) "
+    try:
+        x_start = parse_hour(args.start)
+        x_end = parse_hour(args.end)
+    except ValueError:
+        sys.exit("Invalid --start/--end; use HH:MM or an hour (e.g. 05:00 or 5).")
+    x_start = max(0.0, min(x_start, span_hours))
+    x_end = max(x_start + 0.01, min(x_end, span_hours))
+
+    print(f"Fetching {args.quantity} for {date_disp} ({tz_label}) "
           f"from {args.ip} channel {args.channel} ...")
     keys, rows = fetch_day(args.ip, args.channel, start_ts, end_ts)
     print(f"  {len(rows)} one-minute records retrieved.")
@@ -588,8 +618,8 @@ def main(argv=None):
                       f"{notemp})")
 
     plot(series, summary, weather=weather, expected=expected,
-         date_str=day.isoformat(), channel=args.channel, tz_label=tz_label,
-         quantity=args.quantity, span_hours=span_hours, theme=args.theme,
+         date_str=date_disp, channel=args.channel, tz_label=tz_label,
+         quantity=args.quantity, x_start=x_start, x_end=x_end, theme=args.theme,
          show_band=not args.no_band, out_path=args.output,
          do_show=not args.no_show)
 

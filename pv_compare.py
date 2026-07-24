@@ -12,9 +12,9 @@ delta in kWh, and each day's total. The terminal prints a full comparison table
 correlation, mean absolute difference and RMSE over the overlapping minutes).
 
 Examples:
-    python pv_compare.py 2026-07-22 2026-07-20
-    python pv_compare.py 2026-07-22 2026-07-20 --band --theme dark -o cmp.png
-    python pv_compare.py 2026-07-22 2026-07-20 -q consumption -c 0
+    python pv_compare.py 22-07-2026 20-07-2026
+    python pv_compare.py 22-07-2026 20-07-2026 --band --theme dark -o cmp.png
+    python pv_compare.py 22-07-2026 20-07-2026 -q consumption -c 0
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ from pv_day import (
     build_series,
     fetch_day,
     hm,
+    parse_hour,
     resolve_timezone,
     summarize,
 )
@@ -53,9 +54,9 @@ TITLE = {"production": "PV production comparison",
 # ------------------------------------------------------------------ load
 def parse_date(text: str) -> dt.date:
     try:
-        return dt.date.fromisoformat(text)
+        return dt.datetime.strptime(text, "%d-%m-%Y").date()
     except ValueError:
-        sys.exit(f"Invalid date '{text}'. Use YYYY-MM-DD, e.g. 2026-07-22.")
+        sys.exit(f"Invalid date '{text}'. Use dd-mm-yyyy, e.g. 22-07-2026.")
 
 
 def load_day(ip, channel, day, tzinfo, quantity):
@@ -177,7 +178,7 @@ def print_comparison(date_a, date_b, sum_a, sum_b, cs):
 
 # ------------------------------------------------------------------ plot
 def plot_compare(series_a, series_b, sum_a, sum_b, cs, *, date_a, date_b,
-                 channel, tz_label, quantity, span_hours, theme, show_band,
+                 channel, tz_label, quantity, x_start, x_end, theme, show_band,
                  out_path, do_show):
     import matplotlib
     if not do_show:
@@ -204,7 +205,7 @@ def plot_compare(series_a, series_b, sum_a, sum_b, cs, *, date_a, date_b,
     ax.axhline(0, color=c["axis"], linewidth=1.0)
 
     # Axes chrome
-    ax.set_xlim(0, span_hours)
+    ax.set_xlim(x_start, x_end)
     ax.xaxis.set_major_locator(MultipleLocator(2))
     ax.xaxis.set_minor_locator(MultipleLocator(1))
     ax.xaxis.set_major_formatter(FuncFormatter(lambda x, _pos: hm(x)))
@@ -266,8 +267,8 @@ def plot_compare(series_a, series_b, sum_a, sum_b, cs, *, date_a, date_b,
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description="Compare Shelly Pro EM power for two days on one graph.")
-    p.add_argument("date_a", help="First day (A), YYYY-MM-DD")
-    p.add_argument("date_b", help="Second day (B), YYYY-MM-DD")
+    p.add_argument("date_a", help="First day (A), dd-mm-yyyy")
+    p.add_argument("date_b", help="Second day (B), dd-mm-yyyy")
     p.add_argument("--ip", default=DEFAULT_IP,
                    help=f"Shelly device IP (default: {DEFAULT_IP})")
     p.add_argument("-c", "--channel", type=int, default=DEFAULT_CHANNEL,
@@ -281,6 +282,12 @@ def parse_args(argv=None):
                    help="Save the chart to this PNG path")
     p.add_argument("--theme", default="light", choices=["light", "dark"],
                    help="Colour theme (default: light)")
+    p.add_argument("--start", default="05:00",
+                   help="Start of the plotted time-of-day window, HH:MM or hour "
+                        "(default: 05:00)")
+    p.add_argument("--end", default="22:00",
+                   help="End of the plotted time-of-day window, HH:MM or hour "
+                        "(default: 22:00)")
     p.add_argument("--band", action="store_true",
                    help="Also shade each day's intra-minute min/max band")
     p.add_argument("--no-show", action="store_true",
@@ -291,9 +298,10 @@ def parse_args(argv=None):
 def main(argv=None):
     args = parse_args(argv)
     day_a, day_b = parse_date(args.date_a), parse_date(args.date_b)
+    disp_a, disp_b = day_a.strftime("%d-%m-%Y"), day_b.strftime("%d-%m-%Y")
 
     tzinfo, tz_label = resolve_timezone(args.ip, args.tz)
-    print(f"Fetching {args.quantity} for {day_a} and {day_b} ({tz_label}) "
+    print(f"Fetching {args.quantity} for {disp_a} and {disp_b} ({tz_label}) "
           f"from {args.ip} channel {args.channel} ...")
     series_a, sum_a, span_a = load_day(args.ip, args.channel, day_a, tzinfo,
                                        args.quantity)
@@ -302,13 +310,22 @@ def main(argv=None):
     print(f"  {len(series_a['avg_w'])} + {len(series_b['avg_w'])} "
           f"one-minute records retrieved.")
 
+    span = max(span_a, span_b)
+    try:
+        x_start = parse_hour(args.start)
+        x_end = parse_hour(args.end)
+    except ValueError:
+        sys.exit("Invalid --start/--end; use HH:MM or an hour (e.g. 05:00 or 5).")
+    x_start = max(0.0, min(x_start, span))
+    x_end = max(x_start + 0.01, min(x_end, span))
+
     cs = compare_stats(series_a, series_b, sum_a, sum_b)
-    print_comparison(day_a.isoformat(), day_b.isoformat(), sum_a, sum_b, cs)
+    print_comparison(disp_a, disp_b, sum_a, sum_b, cs)
 
     plot_compare(series_a, series_b, sum_a, sum_b, cs,
-                 date_a=day_a.isoformat(), date_b=day_b.isoformat(),
+                 date_a=disp_a, date_b=disp_b,
                  channel=args.channel, tz_label=tz_label, quantity=args.quantity,
-                 span_hours=max(span_a, span_b), theme=args.theme,
+                 x_start=x_start, x_end=x_end, theme=args.theme,
                  show_band=args.band, out_path=args.output,
                  do_show=not args.no_show)
 
