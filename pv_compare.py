@@ -27,12 +27,25 @@ import sys
 
 # Reuse everything data-related from the single-day script (same directory).
 from pv_day import (
+    DEFAULT_AZIMUTH,
     DEFAULT_CHANNEL,
+    DEFAULT_INV_AC_W,
+    DEFAULT_INV_EFF,
     DEFAULT_IP,
+    DEFAULT_KWP,
+    DEFAULT_LAT,
+    DEFAULT_LON,
+    DEFAULT_NMOT,
+    DEFAULT_SYS_EFF,
+    DEFAULT_TEMP_COEFF_PCT,
+    DEFAULT_TILT,
     PROD_THRESHOLD_W,
     THEMES,
+    build_expected,
     build_series,
+    compass_to_solar_azimuth,
     fetch_day,
+    fetch_irradiance,
     hm,
     parse_hour,
     resolve_timezone,
@@ -124,6 +137,35 @@ def compare_stats(series_a, series_b, sum_a, sum_b):
     }
 
 
+def expected_fairness(exp_a, exp_b):
+    """Pearson correlation between the two days' expected (available-sun) curves
+    over daytime minutes -- an 'is this comparison fair?' indicator. High r means
+    the two days had near-identical sun, so production differences reflect the
+    system rather than the weather."""
+    import numpy as np
+
+    ma = {int(round(h * 60)): w for h, w in zip(exp_a["hours"], exp_a["exp_w"])}
+    mb = {int(round(h * 60)): w for h, w in zip(exp_b["hours"], exp_b["exp_w"])}
+    common = sorted(set(ma) & set(mb))
+    a = np.array([ma[k] for k in common], dtype=float)
+    b = np.array([mb[k] for k in common], dtype=float)
+    lit = (a > 10.0) | (b > 10.0)                       # daytime only
+    if lit.sum() >= 2 and a[lit].std() > 0 and b[lit].std() > 0:
+        return float(np.corrcoef(a[lit], b[lit])[0, 1])
+    return float("nan")
+
+
+def fairness_verdict(r):
+    """Plain-language read on the expected-sun correlation."""
+    if math.isnan(r):
+        return "n/a"
+    if r >= 0.95:
+        return "fair"
+    if r >= 0.85:
+        return "some caution"
+    return "weather-confounded"
+
+
 def signed_hm(delta_hours: float) -> str:
     """Signed H:MM string for a time-of-day difference (ASCII sign)."""
     sign = "+" if delta_hours >= 0 else "-"
@@ -179,7 +221,8 @@ def print_comparison(date_a, date_b, sum_a, sum_b, cs):
 # ------------------------------------------------------------------ plot
 def plot_compare(series_a, series_b, sum_a, sum_b, cs, *, date_a, date_b,
                  channel, tz_label, quantity, x_start, x_end, theme, show_band,
-                 out_path, do_show):
+                 out_path, do_show, expected_a=None, expected_b=None,
+                 fair_r=float("nan")):
     import matplotlib
     if not do_show:
         matplotlib.use("Agg")
@@ -198,10 +241,17 @@ def plot_compare(series_a, series_b, sum_a, sum_b, cs, *, date_a, date_b,
             if s["band_lo"]:
                 ax.fill_between(s["hours"], s["band_lo"], s["band_hi"],
                                 color=col, alpha=0.13, linewidth=0)
+    # Expected (available-sun) curves: dashed and behind the production lines so
+    # the raw production stays the visual focus.
+    for exp, col, d in ((expected_a, col_a, date_a), (expected_b, col_b, date_b)):
+        if exp:
+            ax.plot(exp["hours"], exp["exp_w"], color=col, linewidth=1.2,
+                    linestyle=(0, (5, 2.5)), alpha=0.32, zorder=2,
+                    label=f"{d} expected")
     ax.plot(series_b["hours"], series_b["avg_w"], color=col_b, linewidth=2.0,
-            solid_capstyle="round", label=date_b, zorder=3)
+            solid_capstyle="round", label=f"{date_b} production", zorder=3)
     ax.plot(series_a["hours"], series_a["avg_w"], color=col_a, linewidth=2.0,
-            solid_capstyle="round", label=date_a, zorder=4)
+            solid_capstyle="round", label=f"{date_a} production", zorder=4)
     ax.axhline(0, color=c["axis"], linewidth=1.0)
 
     # Axes chrome
@@ -235,22 +285,39 @@ def plot_compare(series_a, series_b, sum_a, sum_b, cs, *, date_a, date_b,
         ax.text(0.017, 0.888, f"({cs['pct']:+.1f}% vs {date_b})",
                 transform=ax.transAxes, va="top", ha="left",
                 color=c["muted"], fontsize=10.5, zorder=6)
-    ax.text(0.017, 0.815, f"{date_a}:  {sum_a['total_kwh']:.2f} kWh",
+    a_pr = ("" if not expected_a or math.isnan(expected_a["pr"])
+            else f"   PR {expected_a['pr'] * 100:.0f}%")
+    b_pr = ("" if not expected_b or math.isnan(expected_b["pr"])
+            else f"   PR {expected_b['pr'] * 100:.0f}%")
+    ax.text(0.017, 0.815, f"{date_a}:  {sum_a['total_kwh']:.2f} kWh{a_pr}",
             transform=ax.transAxes, va="top", ha="left",
             color=col_a, fontsize=12.5, fontweight="bold", zorder=6)
-    ax.text(0.017, 0.760, f"{date_b}:  {sum_b['total_kwh']:.2f} kWh",
+    ax.text(0.017, 0.760, f"{date_b}:  {sum_b['total_kwh']:.2f} kWh{b_pr}",
             transform=ax.transAxes, va="top", ha="left",
             color=col_b, fontsize=12.5, fontweight="bold", zorder=6)
+    if expected_a and expected_b:
+        verdict = fairness_verdict(fair_r)
+        vcol = {"fair": "#0ca30c", "some caution": "#c98500",
+                "weather-confounded": "#d03b3b"}.get(verdict, c["muted"])
+        rtxt = "n/a" if math.isnan(fair_r) else f"{fair_r:.2f}"
+        ax.text(0.017, 0.700, f"Sun match  r = {rtxt}  ({verdict})",
+                transform=ax.transAxes, va="top", ha="left",
+                color=vcol, fontsize=11.5, fontweight="bold", zorder=6)
 
     # Bottom caption: the comparison metrics.
     parts = [f"Peak: {sum_a['peak_w']:,.0f} vs {sum_b['peak_w']:,.0f} W",
              f"Active: {cs['dur_a']:.1f} vs {cs['dur_b']:.1f} h"]
     if not math.isnan(cs["r"]):
-        parts.append(f"correlation r = {cs['r']:.2f}")
+        parts.append(f"production r = {cs['r']:.2f}")
     parts.append(f"mean abs diff {cs['mae']:,.0f} W")
     parts.append(f"RMSE {cs['rmse']:,.0f} W")
     fig.text(0.5, 0.005, "     ·     ".join(parts), ha="center", va="bottom",
              color=c["ink2"], fontsize=10)
+
+    if expected_a or expected_b:
+        leg = ax.legend(loc="upper right", frameon=False, fontsize=8.5)
+        for txt in leg.get_texts():
+            txt.set_color(c["ink2"])
 
     fig.tight_layout(rect=(0, 0.03, 1, 1))
 
@@ -290,6 +357,32 @@ def parse_args(argv=None):
                         "(default: 22:00)")
     p.add_argument("--band", action="store_true",
                    help="Also shade each day's intra-minute min/max band")
+    p.add_argument("-e", "--expected", action="store_true",
+                   help="Overlay each day's datasheet-based expected output "
+                        "(dashed) and report per-day PR + a sun-match fairness r")
+    p.add_argument("--lat", type=float, default=DEFAULT_LAT,
+                   help=f"Latitude for the weather lookup (default: {DEFAULT_LAT})")
+    p.add_argument("--lon", type=float, default=DEFAULT_LON,
+                   help=f"Longitude for the weather lookup (default: {DEFAULT_LON})")
+    p.add_argument("--tilt", type=float, default=DEFAULT_TILT,
+                   help=f"Panel tilt deg, 0=flat 90=vertical (default: {DEFAULT_TILT:g})")
+    p.add_argument("--azimuth", type=float, default=DEFAULT_AZIMUTH,
+                   help="Panel azimuth in compass degrees (0=N, 90=E, 180=S, "
+                        f"270=W; default: {DEFAULT_AZIMUTH:g})")
+    p.add_argument("--kwp", type=float, default=DEFAULT_KWP,
+                   help=f"Array STC nameplate, kWp (default: {DEFAULT_KWP:g})")
+    p.add_argument("--temp-coeff", type=float, default=DEFAULT_TEMP_COEFF_PCT,
+                   help="Pmax temperature coefficient, percent per degC "
+                        f"(default: {DEFAULT_TEMP_COEFF_PCT:g})")
+    p.add_argument("--nmot", type=float, default=DEFAULT_NMOT,
+                   help=f"Nominal module operating temp, degC (default: {DEFAULT_NMOT:g})")
+    p.add_argument("--inverter-eff", type=float, default=DEFAULT_INV_EFF,
+                   help=f"Inverter efficiency, 0-1 (default: {DEFAULT_INV_EFF:g})")
+    p.add_argument("--system-eff", type=float, default=DEFAULT_SYS_EFF,
+                   help="Wiring/soiling/mismatch loss factor, 0-1 "
+                        f"(default: {DEFAULT_SYS_EFF:g})")
+    p.add_argument("--inverter-ac", type=float, default=DEFAULT_INV_AC_W,
+                   help=f"Inverter AC cap for clipping, W (default: {DEFAULT_INV_AC_W:g})")
     p.add_argument("--no-show", action="store_true",
                    help="Do not open an interactive window (just save)")
     return p.parse_args(argv)
@@ -322,12 +415,51 @@ def main(argv=None):
     cs = compare_stats(series_a, series_b, sum_a, sum_b)
     print_comparison(disp_a, disp_b, sum_a, sum_b, cs)
 
+    expected_a = expected_b = None
+    fair_r = float("nan")
+    if args.expected and args.quantity != "production":
+        print("  (expected overlay applies to --quantity production; skipped)",
+              file=sys.stderr)
+    elif args.expected:
+        az_solar = compass_to_solar_azimuth(args.azimuth)
+        print(f"  Fetching plane-of-array irradiance for {args.lat:.4f}, "
+              f"{args.lon:.4f}  (tilt {args.tilt:g} deg, azimuth {args.azimuth:g} "
+              f"deg compass) ...")
+        model = dict(kwp=args.kwp, temp_coeff=args.temp_coeff / 100.0,
+                     nmot=args.nmot, inv_eff=args.inverter_eff,
+                     sys_eff=args.system_eff, inv_ac_w=args.inverter_ac)
+
+        def _expected_for(day, series, summ):
+            irr = fetch_irradiance(args.lat, args.lon, day, tz_label,
+                                   args.tilt, az_solar)
+            if not irr:
+                return None
+            hrs, wm2, _kind, temps = irr
+            return build_expected(series, hrs, wm2, temps, **model,
+                                  actual_kwh=summ["total_kwh"] if summ else 0.0)
+
+        expected_a = _expected_for(day_a, series_a, sum_a)
+        expected_b = _expected_for(day_b, series_b, sum_b)
+        for disp, exp in ((disp_a, expected_a), (disp_b, expected_b)):
+            if exp:
+                pr = exp["pr"]
+                prt = "n/a" if math.isnan(pr) else f"{pr * 100:.0f}%"
+                print(f"  {disp}: expected {exp['expected_kwh']:.2f} kWh, "
+                      f"PR {prt}, available sun {exp['poa_insol']:.2f} kWh/m2")
+            else:
+                print(f"  ({disp}: irradiance unavailable)", file=sys.stderr)
+        if expected_a and expected_b:
+            fair_r = expected_fairness(expected_a, expected_b)
+            print(f"  Expected-sun match: r = {fair_r:.3f} "
+                  f"({fairness_verdict(fair_r)})")
+
     plot_compare(series_a, series_b, sum_a, sum_b, cs,
                  date_a=disp_a, date_b=disp_b,
                  channel=args.channel, tz_label=tz_label, quantity=args.quantity,
                  x_start=x_start, x_end=x_end, theme=args.theme,
                  show_band=args.band, out_path=args.output,
-                 do_show=not args.no_show)
+                 do_show=not args.no_show,
+                 expected_a=expected_a, expected_b=expected_b, fair_r=fair_r)
 
 
 if __name__ == "__main__":
