@@ -383,6 +383,10 @@ def parse_args(argv=None):
                         f"(default: {DEFAULT_SYS_EFF:g})")
     p.add_argument("--inverter-ac", type=float, default=DEFAULT_INV_AC_W,
                    help=f"Inverter AC cap for clipping, W (default: {DEFAULT_INV_AC_W:g})")
+    p.add_argument("--model", default=None,
+                   help="Force an Open-Meteo weather model on the forecast "
+                        "endpoints, e.g. italia_meteo_arpae_icon_2i (default: "
+                        "Open-Meteo best-match blend)")
     p.add_argument("--no-show", action="store_true",
                    help="Do not open an interactive window (just save)")
     return p.parse_args(argv)
@@ -431,7 +435,7 @@ def main(argv=None):
 
         def _expected_for(day, series, summ):
             irr = fetch_irradiance(args.lat, args.lon, day, tz_label,
-                                   args.tilt, az_solar)
+                                   args.tilt, az_solar, model=args.model)
             if not irr:
                 return None
             hrs, wm2, _kind, temps = irr

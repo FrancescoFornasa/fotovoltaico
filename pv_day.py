@@ -43,7 +43,7 @@ DEFAULT_TZ = "Europe/Rome"   # fallback if the device doesn't report one
 DEFAULT_LAT = 45.40413928652185   # weather lookup location (override with --lat)
 DEFAULT_LON = 10.985198862530082  # (override with --lon)
 DEFAULT_TILT = 30.0               # panel tilt, degrees (0 = flat, 90 = vertical)
-DEFAULT_AZIMUTH = 197.29          # panel azimuth, compass deg (0=N 90=E 180=S 270=W)
+DEFAULT_AZIMUTH = 190.4           # panel azimuth, compass deg (0=N 90=E 180=S 270=W)
 HTTP_TIMEOUT = 20            # seconds
 PROD_THRESHOLD_W = 5.0       # minimum power counted as "producing"
 
@@ -165,7 +165,7 @@ def compass_to_solar_azimuth(compass_deg: float) -> float:
 
 
 def fetch_irradiance(lat: float, lon: float, day: dt.date, tz_name: str | None,
-                     tilt: float, azimuth: float):
+                     tilt: float, azimuth: float, model: str | None = None):
     """Plane-of-array (tilted) irradiance for `day` from Open-Meteo -- no API
     key. `tilt` is 0-90 deg; `azimuth` uses Open-Meteo's convention (0 = south,
     -90 = east, +90 = west). Uses the *instantaneous* products (`_instant`,
@@ -173,7 +173,9 @@ def fetch_irradiance(lat: float, lon: float, day: dt.date, tz_name: str | None,
     the 1-minute production data; still cloud-affected, so the curve dips on
     cloudy spells. Resolution ladder, finest first: 15-minute from the forecast
     endpoint (recent days, incl. today) -> hourly forecast -> hourly reanalysis
-    archive (older days). Falls back to horizontal GHI if a source lacks the
+    archive (older days). `model` optionally forces an Open-Meteo weather model
+    (e.g. 'italia_meteo_arpae_icon_2i') on the forecast endpoints; the archive is
+    ERA5 and ignores it. Falls back to horizontal GHI if a source lacks the
     tilted product. Returns (hours, wm2, kind, temps) or None; temps is ambient
     air degC (NaN where the source lacks it)."""
     base_params = {
@@ -188,7 +190,10 @@ def fetch_irradiance(lat: float, lon: float, day: dt.date, tz_name: str | None,
     for base, block in (("https://api.open-meteo.com/v1/forecast", "minutely_15"),
                         ("https://api.open-meteo.com/v1/forecast", "hourly"),
                         ("https://archive-api.open-meteo.com/v1/archive", "hourly")):
-        query = urllib.parse.urlencode({**base_params, block: variables})
+        params = {**base_params, block: variables}
+        if model and "forecast" in base:      # archive is ERA5, ignores models=
+            params["models"] = model
+        query = urllib.parse.urlencode(params)
         try:
             section = _get_json(f"{base}?{query}").get(block) or {}
         except (urllib.error.URLError, ValueError, TimeoutError):
@@ -515,6 +520,10 @@ def parse_args(argv=None):
                         f"(default: {DEFAULT_SYS_EFF:g})")
     p.add_argument("--inverter-ac", type=float, default=DEFAULT_INV_AC_W,
                    help=f"Inverter AC cap for clipping, W (default: {DEFAULT_INV_AC_W:g})")
+    p.add_argument("--model", default=None,
+                   help="Force an Open-Meteo weather model on the forecast "
+                        "endpoints, e.g. italia_meteo_arpae_icon_2i (default: "
+                        "Open-Meteo best-match blend)")
     p.add_argument("-o", "--output", default=None,
                    help="Save the chart to this PNG path")
     p.add_argument("--theme", default="light", choices=["light", "dark"],
@@ -588,7 +597,7 @@ def main(argv=None):
               f"{args.lon:.4f}  (tilt {args.tilt:g} deg, azimuth {args.azimuth:g} "
               f"deg compass) ...")
         irr = fetch_irradiance(args.lat, args.lon, day, tz_label,
-                               args.tilt, az_solar)
+                               args.tilt, az_solar, model=args.model)
         if not irr:
             print("  (irradiance unavailable for that date/location; plotting "
                   "production only)", file=sys.stderr)
