@@ -1,0 +1,6 @@
+# Saved charts
+results/
+
+# Python bytecode cache
+__pycache__/
+*.pyc
