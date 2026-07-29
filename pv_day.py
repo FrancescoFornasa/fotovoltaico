@@ -277,6 +277,7 @@ def build_expected(series, w_hours, poa, temps, *, kwp, temp_coeff, nmot,
     pr = actual_kwh / (kwp * poa_insol) if poa_insol > 0 else float("nan")
     return {
         "hours": series["hours"], "exp_w": exp.tolist(),
+        "poa_wm2": gi.tolist(),
         "expected_kwh": expected_kwh, "poa_insol": poa_insol,
         "pr": pr, "lost_kwh": expected_kwh - actual_kwh, "temp_used": temp_used,
     }
@@ -470,7 +471,8 @@ def plot(series, summary, *, date_str, channel, tz_label, quantity,
     if out_path:
         out_dir = os.path.dirname(os.path.abspath(out_path))
         os.makedirs(out_dir, exist_ok=True)
-        fig.savefig(out_path, facecolor=fig.get_facecolor(), bbox_inches="tight")
+        fig.savefig(out_path, facecolor=fig.get_facecolor(), bbox_inches="tight",
+                    dpi=200)
         print(f"Saved chart to {out_path}")
     if do_show:
         plt.show()

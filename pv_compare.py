@@ -323,7 +323,8 @@ def plot_compare(series_a, series_b, sum_a, sum_b, cs, *, date_a, date_b,
 
     if out_path:
         os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-        fig.savefig(out_path, facecolor=fig.get_facecolor(), bbox_inches="tight")
+        fig.savefig(out_path, facecolor=fig.get_facecolor(), bbox_inches="tight",
+                    dpi=200)
         print(f"Saved chart to {out_path}")
     if do_show:
         plt.show()
