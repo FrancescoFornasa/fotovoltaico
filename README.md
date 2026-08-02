@@ -58,9 +58,9 @@ scripts are general‑purpose.
 | **PV channel** | `em1` **channel 1** — production flows in the *return* (export) direction |
 | **Array** | 6 × **Peimar OR10H500MNDB (BF)** = **3.0 kWp** (front), bifacial TOPCon N‑type |
 | **Module** | 500 Wp, efficiency 23.17 %, area 1.903 × 1.134 m, Vmp 36.93 V / Imp 13.54 A |
-| **Temp. coefficient (Pmax)** | −0.29 %/°C · **NMOT** 43 °C |
+| **Temp. coefficient (Pmax)** | −0.29 %/°C · thermal model Faiman **U0 22.5** / **U1 6.84** (NMOT 43 °C as fallback) |
 | **Inverter** | **Growatt MIC 3000TL‑X** — 3000 W AC, single‑MPPT, transformerless, ~97 % efficient |
-| **Orientation** | tilt **30°**, azimuth **≈190°** compass (just west of due south) |
+| **Orientation** | tilt **10°** (measured on the roof, 31-07-2026), azimuth **≈190°** compass (just west of due south) |
 | **Location** | ≈ 45.404 N, 10.985 E (near Verona, Italy), tz Europe/Rome |
 | **Optimizers** | per‑panel DC optimizers installed **2026‑07‑23 ~14:00** to mitigate afternoon shading |
 
@@ -159,9 +159,10 @@ python pv_day.py <dd-mm-yyyy> [options]
 | `-q, --quantity` | production | `production` \| `consumption` \| `net` |
 | `--tz` | (device) | IANA timezone override |
 | `-w, --weather` | off | Overlay actual irradiance, scaled to W (fitted) |
-| `-e, --expected` | off | Overlay datasheet expected output + PR + kWh lost |
+| `-e, --expected` | off | Overlay datasheet expected output + PI + PR + kWh lost |
 | `--lat` / `--lon` | 45.404 / 10.985 | Weather location |
-| `--tilt` / `--azimuth` | 30 / 190.4 | Panel geometry (azimuth in compass degrees) |
+| `--tilt` / `--azimuth` | 10 / 190.4 | Panel geometry (azimuth in compass degrees) |
+| `--u0` / `--u1` | 22.5 / 6.84 | Faiman cell‑temperature coefficients |
 | `--kwp` | 3.0 | Array STC nameplate (kWp) |
 | `--temp-coeff` | −0.29 | Pmax temp coefficient (%/°C) |
 | `--nmot` | 43 | Nominal module operating temp (°C) |
@@ -178,7 +179,7 @@ python pv_day.py <dd-mm-yyyy> [options]
 `--weather` draws a *fitted* "sun available" line (irradiance scaled to Watts by
 a least‑squares fit). `--expected` draws the *physical* model line described
 [below](#the-expectedoutput-model--in-detail), a red shortfall fill, the
-Performance Ratio, and the kWh lost.
+Performance Index and Ratio, the peak cell temperature, and the kWh lost.
 
 ### `pv_compare.py` — two days head‑to‑head
 
@@ -204,11 +205,16 @@ draws a 2×2 dashboard:
 |  | whole‑day (left) | afternoon (right) |
 |---|---|---|
 | **production (top)** | absolute daily kWh | afternoon kWh (from 14:00) |
-| **Performance Ratio (bottom)** | whole‑day PR % | afternoon PR % |
+| **normalised (bottom)** | whole‑day **PI** bars, PR as hollow ○ markers | afternoon PR % |
 
-Days are coloured **before / install‑day / after** the optimizer date; the PR
+Days are coloured **before / install‑day / after** the optimizer date; the bottom
 panels carry before/after mean lines; partial days (device started mid‑day, or
 today so far) are faded and excluded from the averages.
+
+The bottom‑left panel deliberately shows **both** metrics: the bars are PI and the
+hollow markers are PR, so the vertical gap between them is the thermal model's
+claimed loss. A gap that widens while the bars stay level means a hot spell, not a
+fault — see [Performance Ratio & Index](#performance-ratio--the-fairness-check).
 
 ```bash
 python pv_trend.py [options]
@@ -229,7 +235,8 @@ geometry/model/theme flags as the others.
 All the weather comes from **[Open‑Meteo](https://open-meteo.com)** — free, no
 API key. The scripts request **plane‑of‑array (tilted) irradiance**
 (`global_tilted_irradiance`) for your exact tilt/azimuth, i.e. the sunlight
-actually landing on the panels, not on a flat surface.
+actually landing on the panels, not on a flat surface, plus `temperature_2m` and
+`wind_speed_10m` — the two inputs the Faiman cell‑temperature model needs.
 
 Three things were important to get right:
 
@@ -273,11 +280,11 @@ expected_W(t) = kWp × POA(t) × [ 1 + γ·(T_cell(t) − 25) ] × η_inv × η_
 expected_W(t) = min( expected_W(t), inverter_AC_cap )        # inverter clipping
 ```
 
-with the cell temperature estimated from ambient air temperature and the module
-NMOT rating:
+with the cell temperature estimated from ambient air temperature, sunlight and
+**wind**, via the Faiman model:
 
 ```
-T_cell(t) = T_air(t) + (POA(t) / 800) × (NMOT − 20)
+T_cell(t) = T_air(t) + POA(t) / ( U0 + U1 × wind_ms(t) )
 ```
 
 Read it left to right as *"ideal power → scaled by how much sun → minus heat →
@@ -308,17 +315,36 @@ fraction −0.0029), referenced to the 25 °C STC point:
 This single term is the main reason the same sun yields different power on a hot
 vs a cool day.
 
-**`T_cell` — estimated, not measured (the NMOT model).**
-Cells run hotter than the air because they absorb sunlight. The standard estimate
-uses the datasheet **NMOT** (Nominal Module Operating Temperature, 43 °C, defined
-at 800 W/m² and 20 °C air):
+**`T_cell` — estimated, not measured (the Faiman model).**
+Cells run hotter than the air because they absorb sunlight, and how *much* hotter
+depends on how fast the wind carries that heat away. The **Faiman** model splits
+the cooling into a still‑air term and a wind term:
 
 ```
-T_cell = T_air + (POA / 800) × (NMOT − 20)   =   T_air + (POA / 800) × 23
+T_cell = T_air + POA / (U0 + U1 × wind_ms)
 ```
 
-`T_air` comes from Open‑Meteo (`temperature_2m`). Example: air 30 °C, POA 900 →
-`T_cell ≈ 30 + (900/800)·23 ≈ 56 °C`.
+- **`U0` — still‑air cooling (W/m²K), default 22.5.** Fitted to this array over
+  24–31 July 2026. It sits below the ~25 typical of a free‑standing rack because
+  these panels are mounted nearly flush at 10° tilt, so air can barely move behind
+  them. Lower `U0` = worse cooling = hotter cells. Override with `--u0`.
+- **`U1` — wind cooling (W/m³sK), default 6.84.** The standard literature value.
+  Override with `--u1`.
+
+`T_air` and `wind_speed_10m` both come from Open‑Meteo (wind arrives in km/h and
+is converted to m/s internally). Example: air 30 °C, POA 900, wind 4 km/h (1.1 m/s)
+→ `T_cell ≈ 30 + 900/(22.5 + 6.84·1.1) ≈ 60 °C`; the same minute at 15 km/h
+(4.2 m/s) → `≈ 48 °C`. **Twelve degrees of cell temperature, ~3.5 % of output,
+purely from wind.**
+
+> **Why not NMOT?** The older model, `T_cell = T_air + (POA/800)×(NMOT−20)`, has no
+> wind term at all — it bakes in one fixed cooling rate. During the windless
+> heatwave of late July 2026 (wind fell from 10.4 to 3.9 km/h over a week) it
+> steadily under‑predicted cell temperature, and the expected curve drifted too
+> high. Switching to Faiman removed about half of that drift. NMOT is still used
+> as an automatic fallback when a weather source returns no wind data, which is
+> what `--nmot` now controls; `expected["wind_used"]` reports which model ran, and
+> `pv_day.py --expected` prints the peak cell temperature and the model behind it.
 
 **`η_inv` — inverter conversion loss (≈ 0.97).**
 The Growatt converts DC→AC at ~97 %. This matters because the Shelly measures the
@@ -343,9 +369,16 @@ Integrating the per‑minute series over the day (1 sample = 1 minute, so divide
 ```
 expected_kWh  = Σ expected_W(t) / 60 / 1000
 POA_insolation H (kWh/m²) = Σ POA(t) / 60 / 1000
-Performance Ratio  PR = actual_kWh / (kWp × H)
+Performance Ratio  PR = actual_kWh / (kWp × H)          sun only
+Performance Index  PI = actual_kWh / expected_kWh       sun + heat + wind + losses
 kWh lost = expected_kWh − actual_kWh
 ```
+
+Note both are integrals of *different* curves: PR divides by the area under the
+**weather** curve, PI by the area under the **expected‑power** curve. The heat
+factor sits *inside* the second sum and cannot be pulled out of it, because the
+panels are hottest exactly when the sun is strongest — using the day's average
+heat factor instead overstates expected output by ~2 %.
 
 `pv_trend.py` computes the same quantities restricted to the **afternoon window**
 (default from 14:00) to isolate the shading — using per‑minute POA exposed by the
@@ -353,12 +386,12 @@ model — giving an *afternoon PR* alongside the whole‑day PR.
 
 ### Worked example (one clear midday minute)
 
-`POA = 900 W/m²`, air `30 °C` → `T_cell ≈ 56 °C`:
+`POA = 900 W/m²`, air `30 °C`, wind `4 km/h` (1.1 m/s) → `T_cell ≈ 60 °C`:
 
 ```
-expected_W = 3.0 × 900 × [1 − 0.0029·(56 − 25)] × 0.97 × 0.95
-           = 3.0 × 900 × 0.910 × 0.97 × 0.95
-           ≈ 2264 W
+expected_W = 3.0 × 900 × [1 − 0.0029·(60 − 25)] × 0.97 × 0.95
+           = 3.0 × 900 × 0.899 × 0.97 × 0.95
+           ≈ 2237 W
 ```
 
 That's an implied instantaneous conversion of ~2.5 W per W/m² — a healthy value
@@ -388,6 +421,63 @@ It divides out *how sunny the day was*, so it's the fair way to compare days: a
 cloudy day and a clear day can have the same PR if the system behaved the same.
 Typical healthy residential PR is ~0.75–0.85.
 
+**PR normalises sunlight only — not temperature.** This trips people up, so be
+explicit about it:
+
+```
+PR = actual_kWh / (kWp × POA_insolation)
+```
+
+The denominator is *cloud‑affected* POA, so **clouds are divided out**: an overcast
+day shrinks both the numerator and the denominator and PR barely moves. But there
+is no temperature term anywhere in that formula, so **heat is not divided out**.
+Cell temperature is weather too, and a heatwave drags PR down on a perfectly
+healthy array. Late July 2026 is the worked example: PR fell 68 % → 64 % over a
+week in which the array was fine and the air went from 27 °C to 34 °C.
+
+Nor does PR account for wind, spectrum, soiling, or panel ageing — they all land
+in the same bucket.
+
+### Performance Index (PI) — the temperature‑aware companion
+
+**PI = actual ÷ expected.** Same numerator as PR, but the denominator is the
+integral of the whole expected curve, so sun *and* heat *and* wind *and* the
+modelled losses are all divided out. 100 % means "exactly what the physics says";
+all three scripts print it, and `pv_trend.py` plots it.
+
+The two are related by an exact identity — no new measurement is involved:
+
+```
+PI = PR / ( heat_factor × η_inv × η_sys )
+```
+
+So `PR/PI` **is** the model's claimed explanation, made explicit. Over the late‑July
+2026 heatwave it slid 0.869 → 0.836, i.e. the model claiming "it got hotter."
+
+| question | use |
+|---|---|
+| Is the array healthy *today*, heat and wind accounted for? | **PI** ← the headline |
+| What did the meter and the sun actually do, with no model in between? | **PR** ← the audit trail |
+
+**Why keep PR when PI is more informative?** Because PI is flat *by construction*
+when the model is right, which makes a flat PI weak evidence. If the array lost
+3 % and `U0` happened to over‑correct by 3 %, PI would not move and you would see
+nothing; PR would show the drop. PR is also immune to model revisions (re‑fit `U0`
+and every historical PI changes, every historical PR does not) and is comparable
+to the 0.75–0.85 industry benchmark, which PI is not.
+
+Read them together:
+
+| pattern | meaning |
+|---|---|
+| PR down, PI flat | environmental — a hot or still spell. Nothing to fix. |
+| PR and PI both down | something in the system actually changed. |
+| both spike on one day | suspect that day's irradiance data, not the array. |
+
+Worked example, 24‑07 → 31‑07 2026: PR fell 3.5 points while PI fell 1.1. The model
+claims heat explains 2.4 of them — well supported in direction, with the remainder
+inside the noise `U0` allows.
+
 **Sun‑match fairness r** (in `pv_compare.py --expected`) is the Pearson
 correlation between the two days' *expected* curves over daytime minutes. A high
 r (≥ 0.95, labelled *fair*) means the two days had near‑identical sun, so a
@@ -405,6 +495,27 @@ different days "fair".)
   POA model, and (unmodelled) bifacial gain. Trust the *shape* and the
   *before/after difference* more than the absolute percentage; all loss factors
   are CLI‑overridable if you want to tune them.
+- **PR ignores temperature** — see
+  [Performance Ratio](#performance-ratio--the-fairness-check). Clouds are divided
+  out; heat is not. Compare PR only between days of similar temperature, or use
+  actual÷expected instead.
+- **`U0 = 22.5` is barely constrained by the data** — it was fitted on 7 hot, mostly
+  clear days (24–31 July 2026) with no cell‑temperature sensor to check against,
+  and it is by far the softest number in the model. Anything in **U0 ≈ 15–32.5**
+  fits those days within 5 % of the best residual spread, and leave‑one‑out refits
+  swing over **12.5–26.5** — drop a single day and the answer nearly doubles. That
+  range is worth ±16 °C of peak cell temperature and ~5 % of expected kWh. The
+  underlying reason is that the fitting week spanned only 4–14 km/h of daily‑mean
+  wind, and `U1` multiplies wind, so `U0` and `U1` cannot be separated over such a
+  narrow range. **Treat `U0` as an order‑of‑magnitude default, not a measurement**:
+  trust day‑to‑day *changes* in actual÷expected, not its absolute level. A
+  backsheet temperature probe would settle it properly; failing that, re‑fit once
+  there are windy and cool days in the record.
+- **The irradiance denominator is a *forecast*, not a measurement** — even for
+  past days. Open‑Meteo also publishes a satellite‑derived product
+  (`satellite_radiation_seamless`, hourly only) which measures the cloud field
+  instead of predicting it; on 26‑07‑2026 the two disagreed by 11 % (6.05 vs
+  6.71 kWh/m²), which is enough to move a daily PR by ~8 points. Not yet wired in.
 - **Partial days** (device started mid‑day, or "today" so far) are flagged and
   excluded from trend averages, but their bars still appear (faded).
 - **String voltage note** — 6 panels in one series string sit a little below the

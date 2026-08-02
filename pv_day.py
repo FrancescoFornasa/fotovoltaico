@@ -42,7 +42,7 @@ DEFAULT_CHANNEL = 1          # channel 1 = PV production on this device
 DEFAULT_TZ = "Europe/Rome"   # fallback if the device doesn't report one
 DEFAULT_LAT = 45.40413928652185   # weather lookup location (override with --lat)
 DEFAULT_LON = 10.985198862530082  # (override with --lon)
-DEFAULT_TILT = 30.0               # panel tilt, degrees (0 = flat, 90 = vertical)
+DEFAULT_TILT = 10.0               # panel tilt, degrees (0 = flat, 90 = vertical); measured on the roof 31-07-2026
 DEFAULT_AZIMUTH = 190.4           # panel azimuth, compass deg (0=N 90=E 180=S 270=W)
 HTTP_TIMEOUT = 20            # seconds
 PROD_THRESHOLD_W = 5.0       # minimum power counted as "producing"
@@ -50,7 +50,11 @@ PROD_THRESHOLD_W = 5.0       # minimum power counted as "producing"
 # Expected-output model, from the panel + inverter datasheets (override on CLI):
 DEFAULT_KWP = 3.0                 # array STC nameplate, kWp (6 x 500 Wp Peimar)
 DEFAULT_TEMP_COEFF_PCT = -0.29    # Pmax temperature coefficient, % per degC
-DEFAULT_NMOT = 43.0               # nominal module operating temperature, degC
+DEFAULT_NMOT = 43.0               # nominal module operating temperature, degC (fallback only)
+DEFAULT_U0 = 22.5                 # Faiman constant heat-loss coeff, W/m2K -- fitted to
+                                  # 24..31-07-2026; below the ~25 of a free-standing rack
+                                  # because these panels sit flush at 10 deg (poor airflow)
+DEFAULT_U1 = 6.84                 # Faiman wind heat-loss coeff, W/m3sK (standard value)
 DEFAULT_INV_EFF = 0.97            # Growatt MIC 3000TL-X conversion efficiency
 DEFAULT_SYS_EFF = 0.95            # wiring / soiling / mismatch / reflection losses
 DEFAULT_INV_AC_W = 3000.0         # inverter AC output cap, W (models clipping)
@@ -176,8 +180,9 @@ def fetch_irradiance(lat: float, lon: float, day: dt.date, tz_name: str | None,
     archive (older days). `model` optionally forces an Open-Meteo weather model
     (e.g. 'italia_meteo_arpae_icon_2i') on the forecast endpoints; the archive is
     ERA5 and ignores it. Falls back to horizontal GHI if a source lacks the
-    tilted product. Returns (hours, wm2, kind, temps) or None; temps is ambient
-    air degC (NaN where the source lacks it)."""
+    tilted product. Returns (hours, wm2, kind, temps, winds) or None; temps is
+    ambient air degC and winds is 10 m wind speed in km/h (NaN where the source
+    lacks either)."""
     base_params = {
         "latitude": f"{lat:.6f}", "longitude": f"{lon:.6f}",
         "start_date": day.isoformat(), "end_date": day.isoformat(),
@@ -185,7 +190,7 @@ def fetch_irradiance(lat: float, lon: float, day: dt.date, tz_name: str | None,
         "timezone": tz_name if (tz_name and "/" in tz_name) else "auto",
     }
     variables = ("global_tilted_irradiance_instant,"
-                 "shortwave_radiation_instant,temperature_2m")
+                 "shortwave_radiation_instant,temperature_2m,wind_speed_10m")
     stamp = day.isoformat()
     for base, block in (("https://api.open-meteo.com/v1/forecast", "minutely_15"),
                         ("https://api.open-meteo.com/v1/forecast", "hourly"),
@@ -202,21 +207,24 @@ def fetch_irradiance(lat: float, lon: float, day: dt.date, tz_name: str | None,
         gti = section.get("global_tilted_irradiance_instant") or []
         ghi = section.get("shortwave_radiation_instant") or []
         temp_by_t = dict(zip(times, section.get("temperature_2m") or []))
+        wind_by_t = dict(zip(times, section.get("wind_speed_10m") or []))
         if any(v is not None and v > 0 for v in gti):
             values, kind = gti, "Sun on panels"          # plane-of-array
         elif any(v is not None and v > 0 for v in ghi):
             values, kind = ghi, "Sun available (horizontal)"
         else:
             continue
-        hours, wm2, temps = [], [], []
+        hours, wm2, temps, winds = [], [], [], []
         for t, v in zip(times, values):
             if v is not None and t.startswith(stamp):
                 hours.append(int(t[11:13]) + int(t[14:16]) / 60.0)
                 wm2.append(float(v))
                 tv = temp_by_t.get(t)
                 temps.append(float(tv) if tv is not None else float("nan"))
+                wv = wind_by_t.get(t)
+                winds.append(float(wv) if wv is not None else float("nan"))
         if any(v > 0 for v in wm2):
-            return hours, wm2, kind, temps
+            return hours, wm2, kind, temps, winds
     return None
 
 
@@ -245,26 +253,48 @@ def build_reference(series, irradiance):
     return {"hours": series["hours"], "ref_w": (k * gi).tolist(), "k": k, "r": r}
 
 
-def build_expected(series, w_hours, poa, temps, *, kwp, temp_coeff, nmot,
-                   inv_eff, sys_eff, inv_ac_w, actual_kwh):
+def build_expected(series, w_hours, poa, temps, winds=None, *, kwp, temp_coeff,
+                   nmot, inv_eff, sys_eff, inv_ac_w, actual_kwh,
+                   u0=DEFAULT_U0, u1=DEFAULT_U1):
     """Physically-grounded expected AC output from the datasheets, per minute:
 
         expected = kWp * POA * [1 + tc*(Tcell-25)] * inv_eff * sys_eff   (capped)
 
-    Tcell is estimated from ambient air temperature and the NMOT model. There is
-    no shading term -- the gap between this and actual production IS the loss.
-    `temp_coeff` is a fraction per degC (e.g. -0.0029). Returns hours, exp_w,
-    expected_kwh, poa_insol (kWh/m2), pr, lost_kwh, temp_used."""
+    Tcell comes from the **Faiman** model when wind data is available:
+
+        Tcell = Tair + POA / (u0 + u1 * wind_ms)
+
+    which lets the modules run hotter in still air -- the NMOT model (used as a
+    fallback when there is no wind data) assumes one fixed cooling rate and so
+    under-predicts cell temperature during windless heatwaves. There is still no
+    shading term -- the gap between this and actual production IS the loss.
+    `temp_coeff` is a fraction per degC (e.g. -0.0029), `winds` is km/h. Returns
+    hours, exp_w, expected_kwh, poa_insol (kWh/m2), pr, pi, lost_kwh, temp_used,
+    wind_used, t_cell_max.
+
+    `pr` (sun only) and `pi` (sun + heat + wind + losses) differ by exactly the
+    model's claimed loss factors, so PR/PI is that explanation made explicit."""
     import numpy as np
 
     ph = np.array(series["hours"], dtype=float)
     gi = np.interp(ph, w_hours, poa).clip(min=0.0)          # POA at each minute
 
     temp_used = bool(temps) and all(math.isfinite(t) for t in temps)
+    wind_used = False
+    t_cell_max = float("nan")
     if temp_used:
         t_air = np.interp(ph, w_hours, temps)
-        t_cell = t_air + (gi / 800.0) * (nmot - 20.0)       # NMOT model
+        have_wind = (winds is not None and len(winds) == len(w_hours)
+                     and all(math.isfinite(w) for w in winds))
+        if have_wind:
+            wind_ms = np.interp(ph, w_hours, winds) / 3.6   # km/h -> m/s
+            # Faiman: heat shed per m2 per K rises with wind, so still air runs hot
+            t_cell = t_air + gi / np.maximum(u0 + u1 * wind_ms, 1.0)
+            wind_used = True
+        else:
+            t_cell = t_air + (gi / 800.0) * (nmot - 20.0)   # NMOT fallback
         temp_factor = 1.0 + temp_coeff * (t_cell - 25.0)
+        t_cell_max = float(t_cell.max())
     else:
         temp_factor = 1.0
 
@@ -275,11 +305,17 @@ def build_expected(series, w_hours, poa, temps, *, kwp, temp_coeff, nmot,
     expected_kwh = float(exp.sum()) / 60.0 / 1000.0         # 1 sample = 1 minute
     poa_insol = float(gi.sum()) / 60.0 / 1000.0             # kWh/m2
     pr = actual_kwh / (kwp * poa_insol) if poa_insol > 0 else float("nan")
+    # Performance index: actual vs what the model says TODAY's sun+heat+wind
+    # should have produced. Unlike PR this has temperature divided out, so it
+    # stays flat through a heatwave; the price is that it inherits every model
+    # parameter (u0/u1, temp_coeff, inv_eff, sys_eff), whereas PR only needs POA.
+    pi = actual_kwh / expected_kwh if expected_kwh > 0 else float("nan")
     return {
         "hours": series["hours"], "exp_w": exp.tolist(),
         "poa_wm2": gi.tolist(),
         "expected_kwh": expected_kwh, "poa_insol": poa_insol,
-        "pr": pr, "lost_kwh": expected_kwh - actual_kwh, "temp_used": temp_used,
+        "pr": pr, "pi": pi, "lost_kwh": expected_kwh - actual_kwh,
+        "temp_used": temp_used, "wind_used": wind_used, "t_cell_max": t_cell_max,
     }
 
 
@@ -454,8 +490,10 @@ def plot(series, summary, *, date_str, channel, tz_label, quantity,
         if weather and not math.isnan(weather["r"]):
             parts.append(f"Sun-tracking r = {weather['r']:.2f}")
         if expected:
-            pr = expected["pr"]
+            pr, pi = expected["pr"], expected["pi"]
             parts.append(f"Expected {expected['expected_kwh']:.2f} kWh")
+            if not math.isnan(pi):
+                parts.append(f"PI {pi * 100:.0f}%")
             if not math.isnan(pr):
                 parts.append(f"PR {pr * 100:.0f}%")
             parts.append(f"shortfall {expected['lost_kwh']:+.2f} kWh")
@@ -514,7 +552,13 @@ def parse_args(argv=None):
                    help="Pmax temperature coefficient, percent per degC "
                         f"(default: {DEFAULT_TEMP_COEFF_PCT:g})")
     p.add_argument("--nmot", type=float, default=DEFAULT_NMOT,
-                   help=f"Nominal module operating temp, degC (default: {DEFAULT_NMOT:g})")
+                   help="Nominal module operating temp, degC; only used as a "
+                        f"fallback when wind data is missing (default: {DEFAULT_NMOT:g})")
+    p.add_argument("--u0", type=float, default=DEFAULT_U0,
+                   help="Faiman constant heat-loss coeff, W/m2K; lower = worse "
+                        f"cooling (default: {DEFAULT_U0:g})")
+    p.add_argument("--u1", type=float, default=DEFAULT_U1,
+                   help=f"Faiman wind heat-loss coeff, W/m3sK (default: {DEFAULT_U1:g})")
     p.add_argument("--inverter-eff", type=float, default=DEFAULT_INV_EFF,
                    help=f"Inverter efficiency, 0-1 (default: {DEFAULT_INV_EFF:g})")
     p.add_argument("--system-eff", type=float, default=DEFAULT_SYS_EFF,
@@ -604,7 +648,7 @@ def main(argv=None):
             print("  (irradiance unavailable for that date/location; plotting "
                   "production only)", file=sys.stderr)
         else:
-            hours, wm2, kind, temps = irr
+            hours, wm2, kind, temps, winds = irr
             if args.weather:
                 weather = build_reference(series, (hours, wm2))
                 weather["kind"] = kind
@@ -613,20 +657,29 @@ def main(argv=None):
                 print(f"  {kind}: {weather['k']:.2f} W per W/m2{extra}")
             if args.expected:
                 expected = build_expected(
-                    series, hours, wm2, temps,
+                    series, hours, wm2, temps, winds,
                     kwp=args.kwp, temp_coeff=args.temp_coeff / 100.0,
                     nmot=args.nmot, inv_eff=args.inverter_eff,
                     sys_eff=args.system_eff, inv_ac_w=args.inverter_ac,
-                    actual_kwh=summary["total_kwh"] if summary else 0.0)
-                pr = expected["pr"]
-                pr_txt = "n/a" if math.isnan(pr) else f"{pr * 100:.0f}%"
+                    actual_kwh=summary["total_kwh"] if summary else 0.0,
+                    u0=args.u0, u1=args.u1)
+                pr, pi = expected["pr"], expected["pi"]
+                pct = lambda v: "n/a" if math.isnan(v) else f"{v * 100:.0f}%"
                 notemp = "" if expected["temp_used"] else ", no temp data"
                 print(f"  Expected (model): {expected['expected_kwh']:.2f} kWh   "
                       f"Actual: {summary['total_kwh']:.2f} kWh   "
                       f"Shortfall: {expected['lost_kwh']:+.2f} kWh")
-                print(f"  Performance ratio: {pr_txt}   "
+                print(f"  Performance index (vs model, heat divided out): "
+                      f"{pct(pi)}")
+                print(f"  Performance ratio  (vs sun only, heat included): "
+                      f"{pct(pr)}   "
                       f"(POA insolation {expected['poa_insol']:.2f} kWh/m2"
                       f"{notemp})")
+                if expected["temp_used"]:
+                    how = ("Faiman, wind-aware" if expected["wind_used"]
+                           else f"NMOT {args.nmot:g} degC, no wind data")
+                    print(f"  Peak cell temp: {expected['t_cell_max']:.1f} degC "
+                          f"({how})")
 
     plot(series, summary, weather=weather, expected=expected,
          date_str=date_disp, channel=args.channel, tz_label=tz_label,

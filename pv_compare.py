@@ -36,6 +36,8 @@ from pv_day import (
     DEFAULT_LAT,
     DEFAULT_LON,
     DEFAULT_NMOT,
+    DEFAULT_U0,
+    DEFAULT_U1,
     DEFAULT_SYS_EFF,
     DEFAULT_TEMP_COEFF_PCT,
     DEFAULT_TILT,
@@ -285,10 +287,14 @@ def plot_compare(series_a, series_b, sum_a, sum_b, cs, *, date_a, date_b,
         ax.text(0.017, 0.888, f"({cs['pct']:+.1f}% vs {date_b})",
                 transform=ax.transAxes, va="top", ha="left",
                 color=c["muted"], fontsize=10.5, zorder=6)
-    a_pr = ("" if not expected_a or math.isnan(expected_a["pr"])
-            else f"   PR {expected_a['pr'] * 100:.0f}%")
-    b_pr = ("" if not expected_b or math.isnan(expected_b["pr"])
-            else f"   PR {expected_b['pr'] * 100:.0f}%")
+    def _badge(exp):
+        if not exp:
+            return ""
+        bits = [f"{k} {exp[k.lower()] * 100:.0f}%"
+                for k in ("PI", "PR") if not math.isnan(exp[k.lower()])]
+        return ("   " + "   ".join(bits)) if bits else ""
+
+    a_pr, b_pr = _badge(expected_a), _badge(expected_b)
     ax.text(0.017, 0.815, f"{date_a}:  {sum_a['total_kwh']:.2f} kWh{a_pr}",
             transform=ax.transAxes, va="top", ha="left",
             color=col_a, fontsize=12.5, fontweight="bold", zorder=6)
@@ -376,7 +382,13 @@ def parse_args(argv=None):
                    help="Pmax temperature coefficient, percent per degC "
                         f"(default: {DEFAULT_TEMP_COEFF_PCT:g})")
     p.add_argument("--nmot", type=float, default=DEFAULT_NMOT,
-                   help=f"Nominal module operating temp, degC (default: {DEFAULT_NMOT:g})")
+                   help="Nominal module operating temp, degC; only used as a "
+                        f"fallback when wind data is missing (default: {DEFAULT_NMOT:g})")
+    p.add_argument("--u0", type=float, default=DEFAULT_U0,
+                   help="Faiman constant heat-loss coeff, W/m2K; lower = worse "
+                        f"cooling (default: {DEFAULT_U0:g})")
+    p.add_argument("--u1", type=float, default=DEFAULT_U1,
+                   help=f"Faiman wind heat-loss coeff, W/m3sK (default: {DEFAULT_U1:g})")
     p.add_argument("--inverter-eff", type=float, default=DEFAULT_INV_EFF,
                    help=f"Inverter efficiency, 0-1 (default: {DEFAULT_INV_EFF:g})")
     p.add_argument("--system-eff", type=float, default=DEFAULT_SYS_EFF,
@@ -432,27 +444,35 @@ def main(argv=None):
               f"deg compass) ...")
         model = dict(kwp=args.kwp, temp_coeff=args.temp_coeff / 100.0,
                      nmot=args.nmot, inv_eff=args.inverter_eff,
-                     sys_eff=args.system_eff, inv_ac_w=args.inverter_ac)
+                     sys_eff=args.system_eff, inv_ac_w=args.inverter_ac,
+                     u0=args.u0, u1=args.u1)
 
         def _expected_for(day, series, summ):
             irr = fetch_irradiance(args.lat, args.lon, day, tz_label,
                                    args.tilt, az_solar, model=args.model)
             if not irr:
                 return None
-            hrs, wm2, _kind, temps = irr
-            return build_expected(series, hrs, wm2, temps, **model,
+            hrs, wm2, _kind, temps, winds = irr
+            return build_expected(series, hrs, wm2, temps, winds, **model,
                                   actual_kwh=summ["total_kwh"] if summ else 0.0)
 
         expected_a = _expected_for(day_a, series_a, sum_a)
         expected_b = _expected_for(day_b, series_b, sum_b)
+        pct = lambda v: "n/a" if math.isnan(v) else f"{v * 100:.0f}%"
         for disp, exp in ((disp_a, expected_a), (disp_b, expected_b)):
             if exp:
-                pr = exp["pr"]
-                prt = "n/a" if math.isnan(pr) else f"{pr * 100:.0f}%"
                 print(f"  {disp}: expected {exp['expected_kwh']:.2f} kWh, "
-                      f"PR {prt}, available sun {exp['poa_insol']:.2f} kWh/m2")
+                      f"PI {pct(exp['pi'])}, PR {pct(exp['pr'])}, "
+                      f"available sun {exp['poa_insol']:.2f} kWh/m2")
             else:
                 print(f"  ({disp}: irradiance unavailable)", file=sys.stderr)
+        if expected_a and expected_b:
+            # PI is the fairer head-to-head: it divides out the two days' heat
+            d_pi = (expected_b["pi"] - expected_a["pi"]) * 100
+            d_pr = (expected_b["pr"] - expected_a["pr"]) * 100
+            if not (math.isnan(d_pi) or math.isnan(d_pr)):
+                print(f"  B - A:  PI {d_pi:+.1f} pts   PR {d_pr:+.1f} pts"
+                      f"   (PI is the fairer one — heat divided out)")
         if expected_a and expected_b:
             fair_r = expected_fairness(expected_a, expected_b)
             print(f"  Expected-sun match: r = {fair_r:.3f} "

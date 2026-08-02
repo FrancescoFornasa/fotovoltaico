@@ -7,12 +7,22 @@ Pro EM has stored and lays out a 2x2 dashboard:
 
                whole day                 afternoon (from 14:00)
     top:   absolute production (kWh)   afternoon production (kWh)
-    bot:   Performance Ratio (%)       afternoon Performance Ratio (%)
+    bot:   Performance Index + PR (%)  afternoon Performance Ratio (%)
 
-PR = production / (kWp * available sun), normalised by modelled plane-of-array
-irradiance (Open-Meteo), so weather is divided out -- the fair way to judge the
-per-panel optimizers. The afternoon column isolates the window where the shading
-(and thus the optimizers) act, so it is the sharpest signal.
+Two normalised metrics, and the gap between them is informative:
+
+    PR = production / (kWp * available sun)      sun divided out, heat NOT
+    PI = production / expected                   sun, heat, wind, losses all out
+
+PR only needs the modelled plane-of-array irradiance (Open-Meteo), so it is
+nearly model-free but sags in a heatwave even on a healthy array. PI divides by
+the full expected curve, so it stays flat through hot spells -- at the price of
+inheriting every model parameter (u0/u1, temp coeff, efficiencies). The bottom-
+left panel plots PI as bars with PR overlaid as hollow markers: both falling
+together points at the system, PR alone falling points at the weather.
+
+The afternoon column isolates the window where the shading (and thus the
+optimizers) act, so it is the sharpest signal for the optimizer question.
 
 Days are coloured BEFORE / INSTALL DAY / AFTER the optimizer installation, the PR
 panels carry before/after mean lines, and partial days (device started mid-day,
@@ -43,6 +53,8 @@ from pv_day import (
     DEFAULT_LAT,
     DEFAULT_LON,
     DEFAULT_NMOT,
+    DEFAULT_U0,
+    DEFAULT_U1,
     DEFAULT_SYS_EFF,
     DEFAULT_TEMP_COEFF_PCT,
     DEFAULT_TILT,
@@ -115,9 +127,9 @@ def collect(args, tzinfo, tz_label, first, last, opt_date, az_solar, model_kw,
     """Walk every day in [first, last]; return per-day metric dicts."""
     rows = []
     day = first
-    print(f"  {'date':<12}{'status':<19}{'kWh':>6}{'aPM':>6}{'PR':>6}"
+    print(f"  {'date':<12}{'status':<19}{'kWh':>6}{'aPM':>6}{'PI':>6}{'PR':>6}"
           f"{'PRpm':>6}{'sun':>7}")
-    print("  " + "-" * 62)
+    print("  " + "-" * 68)
     while day <= last:
         midnight = dt.datetime.combine(day, dt.time.min, tzinfo=tzinfo)
         nxt = dt.datetime.combine(day + dt.timedelta(days=1), dt.time.min,
@@ -134,14 +146,14 @@ def collect(args, tzinfo, tz_label, first, last, opt_date, az_solar, model_kw,
         n = summ["n_minutes"] if summ else 0
         kwh_pm = _energy_after(series["hours"], series["avg_w"], aft_start)
 
-        pr = poa = pr_pm = float("nan")
+        pr = poa = pr_pm = pi = float("nan")
         irr = fetch_irradiance(args.lat, args.lon, day, tz_label,
                                args.tilt, az_solar, model=args.model)
         if irr:
-            hrs, wm2, _kind, temps = irr
-            exp = build_expected(series, hrs, wm2, temps, actual_kwh=kwh,
+            hrs, wm2, _kind, temps, winds = irr
+            exp = build_expected(series, hrs, wm2, temps, winds, actual_kwh=kwh,
                                  **model_kw)
-            pr, poa = exp["pr"], exp["poa_insol"]
+            pr, pi, poa = exp["pr"], exp["pi"], exp["poa_insol"]
             aft_poa = _energy_after(series["hours"], exp["poa_wm2"], aft_start)
             if aft_poa > 0:
                 pr_pm = kwh_pm / (args.kwp * aft_poa)
@@ -149,12 +161,13 @@ def collect(args, tzinfo, tz_label, first, last, opt_date, az_solar, model_kw,
         cat = classify(day, opt_date)
         partial = n < FULL_DAY_MIN
         rows.append({"date": day, "cat": cat, "kwh": kwh, "kwh_pm": kwh_pm,
-                     "pr": pr, "pr_pm": pr_pm, "n": n, "partial": partial})
+                     "pr": pr, "pi": pi, "pr_pm": pr_pm, "n": n,
+                     "partial": partial})
 
         pct = lambda v: "n/a" if math.isnan(v) else f"{v * 100:.0f}%"
         sun = "n/a" if math.isnan(poa) else f"{poa:.2f}"
         print(f"  {day.strftime('%d-%m-%Y'):<12}{CAT_LABEL[cat]:<19}{kwh:>6.1f}"
-              f"{kwh_pm:>6.1f}{pct(pr):>6}{pct(pr_pm):>6}{sun:>7}"
+              f"{kwh_pm:>6.1f}{pct(pi):>6}{pct(pr):>6}{pct(pr_pm):>6}{sun:>7}"
               f"{'  part' if partial else ''}")
         day += dt.timedelta(days=1)
     return rows
@@ -223,11 +236,22 @@ def plot_trend(rows, *, theme, tz_label, channel, aft_start, stats,
                    color=c["ink"], fontsize=12, fontweight="bold", loc="left",
                    pad=8)
 
-    bars(axBL, "pr", 100.0, "{:.0f}")
-    mean_lines(axBL, stats["pre"], stats["post"])
-    axBL.set_ylabel("PR (%)", color=c["ink2"], fontsize=10)
-    axBL.set_title("Performance ratio — whole day", color=c["ink"], fontsize=12,
-                   fontweight="bold", loc="left", pad=8)
+    bars(axBL, "pi", 100.0, "{:.0f}")
+    mean_lines(axBL, stats["pre_pi"], stats["post_pi"])
+    # PR overlaid as hollow markers. The PI-PR gap is exactly what the thermal
+    # model claims to explain, so a widening gap means a hotter/stiller spell --
+    # not a fault. Both moving together is what a real fault looks like.
+    pr_pts = [(xi, r["pr"] * 100) for xi, r in zip(x, rows)
+              if not math.isnan(r["pr"])]
+    if pr_pts:
+        axBL.plot([p[0] for p in pr_pts], [p[1] for p in pr_pts],
+                  linestyle="none", marker="o", markersize=4.5,
+                  markerfacecolor="none", markeredgecolor=c["ink2"],
+                  markeredgewidth=1.2, zorder=5)
+    axBL.set_ylabel("%", color=c["ink2"], fontsize=10)
+    axBL.set_title("Performance index — whole day   (○ = PR, sun only)",
+                   color=c["ink"], fontsize=12, fontweight="bold", loc="left",
+                   pad=8)
 
     bars(axBR, "pr_pm", 100.0, "{:.0f}")
     mean_lines(axBR, stats["pre_pm"], stats["post_pm"])
@@ -266,7 +290,8 @@ def plot_trend(rows, *, theme, tz_label, channel, aft_start, stats,
     def dv(a, b):
         return "n/a" if (math.isnan(a) or math.isnan(b)) else \
             f"{a * 100:.0f}%→{b * 100:.0f}% ({(b - a) * 100:+.0f})"
-    verdict = (f"Whole-day PR {dv(stats['pre'], stats['post'])}          "
+    verdict = (f"Whole-day PI {dv(stats['pre_pi'], stats['post_pi'])}     "
+               f"PR {dv(stats['pre'], stats['post'])}     "
                f"Afternoon PR {dv(stats['pre_pm'], stats['post_pm'])}")
     fig.text(0.5, 0.945, verdict, ha="center", va="top", color=c["ink2"],
              fontsize=11)
@@ -318,7 +343,13 @@ def parse_args(argv=None):
                    help="Pmax temp coefficient, percent per degC "
                         f"(default: {DEFAULT_TEMP_COEFF_PCT:g})")
     p.add_argument("--nmot", type=float, default=DEFAULT_NMOT,
-                   help=f"Nominal module operating temp, degC (default: {DEFAULT_NMOT:g})")
+                   help="Nominal module operating temp, degC; only used as a "
+                        f"fallback when wind data is missing (default: {DEFAULT_NMOT:g})")
+    p.add_argument("--u0", type=float, default=DEFAULT_U0,
+                   help="Faiman constant heat-loss coeff, W/m2K; lower = worse "
+                        f"cooling (default: {DEFAULT_U0:g})")
+    p.add_argument("--u1", type=float, default=DEFAULT_U1,
+                   help=f"Faiman wind heat-loss coeff, W/m3sK (default: {DEFAULT_U1:g})")
     p.add_argument("--inverter-eff", type=float, default=DEFAULT_INV_EFF,
                    help=f"Inverter efficiency, 0-1 (default: {DEFAULT_INV_EFF:g})")
     p.add_argument("--system-eff", type=float, default=DEFAULT_SYS_EFF,
@@ -359,7 +390,8 @@ def main(argv=None):
     az_solar = compass_to_solar_azimuth(args.azimuth)
     model_kw = dict(kwp=args.kwp, temp_coeff=args.temp_coeff / 100.0,
                     nmot=args.nmot, inv_eff=args.inverter_eff,
-                    sys_eff=args.system_eff, inv_ac_w=args.inverter_ac)
+                    sys_eff=args.system_eff, inv_ac_w=args.inverter_ac,
+                    u0=args.u0, u1=args.u1)
     rows = collect(args, tzinfo, tz_label, first, last, opt_date, az_solar,
                    model_kw, aft_start)
     if not rows:
@@ -373,7 +405,8 @@ def main(argv=None):
         return sum(vals) / len(vals) if vals else float("nan")
 
     stats = {"pre": mean_of("pr", "pre"), "post": mean_of("pr", "post"),
-             "pre_pm": mean_of("pr_pm", "pre"), "post_pm": mean_of("pr_pm", "post")}
+             "pre_pm": mean_of("pr_pm", "pre"), "post_pm": mean_of("pr_pm", "post"),
+             "pre_pi": mean_of("pi", "pre"), "post_pi": mean_of("pi", "post")}
 
     def verdict(name, a, b):
         if math.isnan(a) or math.isnan(b):
@@ -382,6 +415,7 @@ def main(argv=None):
                 f"(delta {(b - a) * 100:+.1f} pts)")
 
     print()
+    print(verdict("Whole-day PI", stats["pre_pi"], stats["post_pi"]))
     print(verdict("Whole-day PR", stats["pre"], stats["post"]))
     print(verdict("Afternoon PR", stats["pre_pm"], stats["post_pm"]))
 
